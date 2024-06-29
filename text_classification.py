@@ -1,89 +1,110 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torchtext;
 
-# Sample text data
-text = "hello world this is a simple text generation example "
-chars = sorted(list(set(text)))
-print('Sorted List', chars)
-char_to_idx = {ch: i for i, ch in enumerate(chars)}
-idx_to_char = {i: ch for i, ch in enumerate(chars)}
-print(f'Char:Idx  {char_to_idx}  Idx:Char {idx_to_char}  ')
-# Hyperparameters
-input_size = len(chars)
-hidden_size = 128
-output_size = len(chars)
-n_layers = 1
-seq_length = 10
-learning_rate = 0.001
-num_epochs = 500
+torchtext.disable_torchtext_deprecation_warning()
+from torchtext.data.utils import get_tokenizer
+from torchtext.vocab import build_vocab_from_iterator
+from torchtext.datasets import IMDB
+from torchtext.data.functional import to_map_style_dataset
+from torch.utils.data import DataLoader
+
+# Load and preprocess the dataset
+tokenizer = get_tokenizer("basic_english")
 
 
-# RNN model definition
-class SimpleRNN(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size, n_layers=1):
-        super(SimpleRNN, self).__init__()
-        self.hidden_size = hidden_size
-        self.n_layers = n_layers
-        self.rnn = nn.RNN(input_size, hidden_size, n_layers, batch_first=True)
+def yield_tokens(data_iter):
+    for _, text in data_iter:
+        yield tokenizer(text)
+
+
+# Text and label processing
+def text_pipeline(x): return vocab(tokenizer(x))
+
+
+def label_pipeline(x): return 1 if x == 'pos' else 0
+
+
+# Collate function for DataLoader
+def collate_batch(batch):
+    label_list, text_list, offsets = [], [], [0]
+    for _label, _text in batch:
+        label_list.append(label_pipeline(_label))
+        processed_text = torch.tensor(text_pipeline(_text), dtype=torch.int64)
+        text_list.append(processed_text)
+        offsets.append(processed_text.size(0))
+    label_list = torch.tensor(label_list, dtype=torch.int64)
+    offsets = torch.tensor(offsets[:-1]).cumsum(dim=0)
+    text_list = torch.cat(text_list)
+    return label_list, text_list, offsets
+
+
+# Define the RNN model
+class SentimentRNN(nn.Module):
+    def __init__(self, vocab_size, embed_size, hidden_size, output_size, num_layers=1):
+        super(SentimentRNN, self).__init__()
+        self.embedding = nn.EmbeddingBag(vocab_size, embed_size, sparse=True)
+        self.rnn = nn.RNN(embed_size, hidden_size, num_layers, batch_first=True)
         self.fc = nn.Linear(hidden_size, output_size)
 
-    def forward(self, x, hidden):
-        out, hidden = self.rnn(x, hidden)
-        out = self.fc(out.reshape(out.size(0) * out.size(1), out.size(2)))
-        return out, hidden
-
-    def init_hidden(self, batch_size):
-        return torch.zeros(self.n_layers, batch_size, self.hidden_size)
+    def forward(self, text, offsets):
+        embedded = self.embedding(text, offsets)
+        out, _ = self.rnn(embedded.unsqueeze(1))
+        out = self.fc(out[:, -1, :])
+        return out
 
 
-# Prepare the data
-def char_tensor(string):
-    tensor = torch.zeros(len(string), len(chars))
-    for c in range(len(string)):
-        tensor[c][char_to_idx[string[c]]] = 1
-    return tensor
+# DRIVER
+# Load IMDB dataset
+train_iter, test_iter = IMDB(split=('train', 'test'))
 
+# Build vocabulary
+vocab = build_vocab_from_iterator(yield_tokens(train_iter), specials=["<unk>"])
+vocab.set_default_index(vocab["<unk>"])
+# Reload dataset with map style
+train_dataset = to_map_style_dataset(train_iter)
+test_dataset = to_map_style_dataset(test_iter)
 
-# Training the model
-model = SimpleRNN(input_size, hidden_size, output_size, n_layers)
+# DataLoader
+batch_size = 32
+train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_batch)
+test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_batch)
+
+# Hyperparameters
+vocab_size = len(vocab)
+embed_size = 100
+hidden_size = 256
+output_size = 2  # binary classification
+num_layers = 2
+# Initialize model, loss function, and optimizer
+model = SentimentRNN(vocab_size, embed_size, hidden_size, output_size, num_layers)
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-model.train()
+optimizer = optim.SGD(model.parameters(), lr=0.001)
+# Training the model
+num_epochs = 5
 for epoch in range(num_epochs):
-    hidden = model.init_hidden(1)
-    for i in range(0, len(text) - seq_length, seq_length):
-        seq_in = text[i:i + seq_length]
-        seq_out = text[i + 1:i + seq_length + 1]
-        seq_in_tensor = char_tensor(seq_in).unsqueeze(0)
-        seq_out_tensor = torch.tensor([char_to_idx[ch] for ch in seq_out])
+    model.train()
+    total_loss = 0
+    for labels, text, offsets in train_dataloader:
         optimizer.zero_grad()
-        output, hidden = model(seq_in_tensor, hidden)
-        loss = criterion(output, seq_out_tensor)
-        loss.backward(retain_graph=True)  # Use retain_graph=True to keep the graph for next iteration
+        output = model(text, offsets)
+        loss = criterion(output, labels)
+        loss.backward()
         optimizer.step()
-        hidden = hidden.detach()  # Detach hidden state to prevent backpropagating through the entire history
-    if (epoch + 1) % 50 == 0:
-        print(f'Epoch [{epoch + 1}/{num_epochs}], Loss: {loss.item():.4f}')
+        total_loss += loss.item()
+    print(f'Epoch {epoch + 1}, Loss: {total_loss / len(train_dataloader):.4f}')
+print('Test data :  ', test_dataloader)
+# Testing the model
+model.eval()
+total_acc, total_count = 0, 0
+with torch.no_grad():
+    for labels, text, offsets in test_dataloader:
+        output = model(text, offsets)
+        pred = output.argmax(1)
+        total_acc += (pred == labels).sum().item()
+        total_count += labels.size(0)
+        print('Pred : ', pred)
+accuracy = total_acc / total_count
+print(f'Test Accuracy: {accuracy:.4f}')
 
-
-# Text generation
-def generate_text(model, start_text, length):
-    model.eval()
-    hidden = model.init_hidden(1)
-    input_seq = char_tensor(start_text).unsqueeze(0)
-    generated_text = start_text
-    for _ in range(length):
-        output, hidden = model(input_seq, hidden)
-        _, top_idx = output.topk(1)
-        predicted_char = idx_to_char[top_idx[-1].item()]
-        generated_text += predicted_char
-        input_seq = char_tensor(predicted_char).unsqueeze(0)
-    return generated_text
-
-
-# Generate new text
-start_text = "hello"
-generated_text = generate_text(model, start_text, 100)
-print("Generated text:")
-print(generated_text)
